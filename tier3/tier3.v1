@@ -1,0 +1,1218 @@
+// ============================================================
+// Tier 3: v1 Compiler in v1 (Self-Hosting SUBLEQ Compiler)
+// ============================================================
+
+// Memory arrays
+array src[65000];
+var src_len;
+var src_pos;
+
+array code[420000];
+var pc;
+var data_p;
+
+// Fixed cells in target memory (addresses 0..19)
+// Address 0..2: JMP startup
+// 3: ZERO = 0
+// 4: NEG1 = -1
+// 5: TEMP
+// 6: TEMP2
+// 7: FP
+// 8: SP
+// 9: ACC
+// 10: OP_LEFT
+// 11: PTR
+// 12: DIFF
+// 13: RET_VAL
+// 14: RET_ADDR
+// 15: MUL_X
+// 16: MUL_Y
+// 17: MUL_PROD
+// 18: CMP_X
+// 19: CMP_Y
+
+// Tokenizer state
+var tok_type;
+var tok_val;
+var tok_start;
+var tok_len;
+
+// Constants table (in target memory)
+array const_vals[2000];
+array const_addrs[2000];
+var num_consts;
+
+// Symbol tables
+array glob_s[300];
+array glob_l[300];
+array glob_addr[300];
+var num_globs;
+
+array arr_s[300];
+array arr_l[300];
+array arr_sz[300];
+array arr_ptr_cell[300];
+var num_arrs;
+
+array fn_s[250];
+array fn_l[250];
+array fn_entry[250];
+array fn_nparams[250];
+array fn_frame_sz[250];
+var num_fns;
+
+// Current function context
+array param_s[12];
+array param_l[12];
+array param_off[12];
+var num_params;
+
+array loc_s[100];
+array loc_l[100];
+array loc_off[100];
+var num_locals;
+
+var cur_frame_sz;
+
+// Lookups output variables
+var find_kind; // 1=local, 2=param, 3=global
+var find_off_or_addr;
+var find_arr_cell;
+var find_fn_entry;
+var find_fn_params;
+var find_fn_frame;
+
+// Runtime points
+var startup_pc;
+var startup_stack_cell;
+var halt_cell;
+var tramp_pc;
+
+// ----------------- Output Helpers -----------------
+
+array p10[10];
+
+func print_int(n) {
+    var i;
+    var d;
+    var p;
+    var started;
+
+    if (n == 0) {
+        putc(48);
+        return 0;
+    }
+    if (n < 0) {
+        putc(45); // '-'
+        // Handle -2147483648 without overflowing literal limit (2147483647)
+        if (n == -2147483647 - 1) {
+            putc(50); putc(49); putc(52); putc(55); putc(52);
+            putc(56); putc(51); putc(54); putc(52); putc(56);
+            return 0;
+        }
+        n = -n;
+    }
+    started = 0;
+    i = 0;
+    while (i < 10) {
+        p = p10[i];
+        d = 0;
+        while (n >= p) {
+            n = n - p;
+            d = d + 1;
+        }
+        if (started == 1) {
+            putc(48 + d);
+        } else {
+            if (d > 0) {
+                started = 1;
+                putc(48 + d);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func print_sp() {
+    putc(32); // ' '
+    return 0;
+}
+
+// ----------------- String Helpers -----------------
+
+func str_eq(s1, l1, s2, l2) {
+    var i;
+    if (l1 != l2) { return 0; }
+    i = 0;
+    while (i < l1) {
+        if (src[s1 + i] != src[s2 + i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+func match_kw2(s, l, c0, c1) {
+    if (l != 2) { return 0; }
+    if (src[s] != c0) { return 0; }
+    if (src[s + 1] != c1) { return 0; }
+    return 1;
+}
+
+func match_kw3(s, l, c0, c1, c2) {
+    if (l != 3) { return 0; }
+    if (src[s] != c0) { return 0; }
+    if (src[s + 1] != c1) { return 0; }
+    if (src[s + 2] != c2) { return 0; }
+    return 1;
+}
+
+func match_kw4(s, l, c0, c1, c2, c3) {
+    if (l != 4) { return 0; }
+    if (src[s] != c0) { return 0; }
+    if (src[s + 1] != c1) { return 0; }
+    if (src[s + 2] != c2) { return 0; }
+    if (src[s + 3] != c3) { return 0; }
+    return 1;
+}
+
+func match_kw5(s, l, c0, c1, c2, c3, c4) {
+    if (l != 5) { return 0; }
+    if (src[s] != c0) { return 0; }
+    if (src[s + 1] != c1) { return 0; }
+    if (src[s + 2] != c2) { return 0; }
+    if (src[s + 3] != c3) { return 0; }
+    if (src[s + 4] != c4) { return 0; }
+    return 1;
+}
+
+func match_kw6(s, l, c0, c1, c2, c3, c4, c5) {
+    if (l != 6) { return 0; }
+    if (src[s] != c0) { return 0; }
+    if (src[s + 1] != c1) { return 0; }
+    if (src[s + 2] != c2) { return 0; }
+    if (src[s + 3] != c3) { return 0; }
+    if (src[s + 4] != c4) { return 0; }
+    if (src[s + 5] != c5) { return 0; }
+    return 1;
+}
+
+// ----------------- Lexer -----------------
+// Token types:
+// 0: EOF
+// 1: INT
+// 2: ID
+// 10..18: Keywords
+// 10: var, 11: array, 12: func, 13: if, 14: else, 15: while, 16: return, 17: getc, 18: putc
+// 20..27: Symbols: ( ) { } [ ] ; ,
+// 30..39: Operators: + - * = == != < <= > >=
+
+func next_tok() {
+    var c;
+    var c2;
+    var val;
+
+    while (src_pos < src_len) {
+        c = src[src_pos];
+        if (c == 32) { src_pos = src_pos + 1; }
+        else { if (c == 9) { src_pos = src_pos + 1; }
+        else { if (c == 13) { src_pos = src_pos + 1; }
+        else { if (c == 10) { src_pos = src_pos + 1; }
+        else {
+            // Check comment '//'
+            if (c == 47) {
+                if (src_pos + 1 < src_len) {
+                    if (src[src_pos + 1] == 47) {
+                        src_pos = src_pos + 2;
+                        while (src_pos < src_len) {
+                            if (src[src_pos] == 10) {
+                                src_pos = src_pos + 1;
+                                return next_tok();
+                            }
+                            src_pos = src_pos + 1;
+                        }
+                        tok_type = 0;
+                        return 0;
+                    }
+                }
+            }
+
+            // Two-character operators
+            if (src_pos + 1 < src_len) {
+                c2 = src[src_pos + 1];
+                if (c == 61) { if (c2 == 61) { tok_type = 34; src_pos = src_pos + 2; return 0; } } // '=='
+                if (c == 33) { if (c2 == 61) { tok_type = 35; src_pos = src_pos + 2; return 0; } } // '!='
+                if (c == 60) { if (c2 == 61) { tok_type = 37; src_pos = src_pos + 2; return 0; } } // '<='
+                if (c == 62) { if (c2 == 61) { tok_type = 39; src_pos = src_pos + 2; return 0; } } // '>='
+            }
+
+            // Single characters
+            if (c == 40) { tok_type = 20; src_pos = src_pos + 1; return 0; } // '('
+            if (c == 41) { tok_type = 21; src_pos = src_pos + 1; return 0; } // ')'
+            if (c == 123) { tok_type = 22; src_pos = src_pos + 1; return 0; } // '{'
+            if (c == 125) { tok_type = 23; src_pos = src_pos + 1; return 0; } // '}'
+            if (c == 91) { tok_type = 24; src_pos = src_pos + 1; return 0; } // '['
+            if (c == 93) { tok_type = 25; src_pos = src_pos + 1; return 0; } // ']'
+            if (c == 59) { tok_type = 26; src_pos = src_pos + 1; return 0; } // ';'
+            if (c == 44) { tok_type = 27; src_pos = src_pos + 1; return 0; } // ','
+            if (c == 43) { tok_type = 30; src_pos = src_pos + 1; return 0; } // '+'
+            if (c == 45) { tok_type = 31; src_pos = src_pos + 1; return 0; } // '-'
+            if (c == 42) { tok_type = 32; src_pos = src_pos + 1; return 0; } // '*'
+            if (c == 61) { tok_type = 33; src_pos = src_pos + 1; return 0; } // '='
+            if (c == 60) { tok_type = 36; src_pos = src_pos + 1; return 0; } // '<'
+            if (c == 62) { tok_type = 38; src_pos = src_pos + 1; return 0; } // '>'
+
+            // Digits
+            if (c >= 48) {
+                if (c <= 57) {
+                    tok_type = 1;
+                    val = 0;
+                    while (src_pos < src_len) {
+                        c2 = src[src_pos];
+                        if (c2 >= 48) {
+                            if (c2 <= 57) {
+                                val = val * 10 + (c2 - 48);
+                                src_pos = src_pos + 1;
+                            } else {
+                                tok_val = val;
+                                return 0;
+                            }
+                        } else {
+                            tok_val = val;
+                            return 0;
+                        }
+                    }
+                    tok_val = val;
+                    return 0;
+                }
+            }
+
+            // Identifiers / Keywords
+            tok_start = src_pos;
+            while (src_pos < src_len) {
+                c2 = src[src_pos];
+                if ((c2 >= 65) * (c2 <= 90) + (c2 >= 97) * (c2 <= 122) + (c2 >= 48) * (c2 <= 57) + (c2 == 95) > 0) {
+                    src_pos = src_pos + 1;
+                } else {
+                    tok_len = src_pos - tok_start;
+                    return classify_ident();
+                }
+            }
+            tok_len = src_pos - tok_start;
+            return classify_ident();
+        }}}}
+    }
+    tok_type = 0; // EOF
+    return 0;
+}
+
+func classify_ident() {
+    var s;
+    var l;
+    s = tok_start;
+    l = tok_len;
+
+    if (match_kw3(s, l, 118, 97, 114) == 1) { tok_type = 10; return 0; } // var
+    if (match_kw5(s, l, 97, 114, 114, 97, 121) == 1) { tok_type = 11; return 0; } // array
+    if (match_kw4(s, l, 102, 117, 110, 99) == 1) { tok_type = 12; return 0; } // func
+    if (match_kw2(s, l, 105, 102) == 1) { tok_type = 13; return 0; } // if
+    if (match_kw4(s, l, 101, 108, 115, 101) == 1) { tok_type = 14; return 0; } // else
+    if (match_kw5(s, l, 119, 104, 105, 108, 101) == 1) { tok_type = 15; return 0; } // while
+    if (match_kw6(s, l, 114, 101, 116, 117, 114, 110) == 1) { tok_type = 16; return 0; } // return
+    if (match_kw4(s, l, 103, 101, 116, 99) == 1) { tok_type = 17; return 0; } // getc
+    if (match_kw4(s, l, 112, 117, 116, 99) == 1) { tok_type = 18; return 0; } // putc
+
+    tok_type = 2; // ID
+    return 0;
+}
+
+func eat(expected) {
+    next_tok();
+    return 0;
+}
+
+// ----------------- Direct Code Emission -----------------
+
+func emit(val) {
+    code[pc] = val;
+    pc = pc + 1;
+    return pc - 1;
+}
+
+func subleq(a, b, c) {
+    emit(a);
+    emit(b);
+    emit(c);
+    return pc - 3;
+}
+
+func get_const(val) {
+    var i;
+    i = 0;
+    while (i < num_consts) {
+        if (const_vals[i] == val) {
+            return const_addrs[i];
+        }
+        i = i + 1;
+    }
+    const_vals[num_consts] = val;
+    const_addrs[num_consts] = data_p;
+    code[data_p] = val;
+    data_p = data_p + 1;
+    num_consts = num_consts + 1;
+    return data_p - 1;
+}
+
+func clr(a) {
+    subleq(a, a, pc + 3);
+    return 0;
+}
+
+func jmp(target) {
+    subleq(4, 3, target); // NEG1 ZERO target
+    return 0;
+}
+
+func mov(dst, src) {
+    clr(5);              // clr TEMP
+    subleq(5, src, pc + 3);
+    clr(dst);
+    subleq(dst, 5, pc + 3);
+    clr(5);
+    return 0;
+}
+
+func mov_const(dst, val) {
+    var c;
+    if (val == 0) {
+        clr(dst);
+        return 0;
+    }
+    c = get_const(val);
+    mov(dst, c);
+    return 0;
+}
+
+func add(dst, src) {
+    clr(5);
+    subleq(5, src, pc + 3);
+    subleq(dst, 5, pc + 3);
+    clr(5);
+    return 0;
+}
+
+func add_const(dst, val) {
+    var c;
+    if (val == 0) { return 0; }
+    c = get_const(val);
+    add(dst, c);
+    return 0;
+}
+
+func sub(dst, src) {
+    subleq(dst, src, pc + 3);
+    return 0;
+}
+
+func sub_const(dst, val) {
+    var c;
+    if (val == 0) { return 0; }
+    c = get_const(val);
+    sub(dst, c);
+    return 0;
+}
+
+func jn(a, target) {
+    subleq(a, 3, target); // if a - ZERO < 0 -> target
+    return 0;
+}
+
+func emit_jz(a) {
+    var p_jump;
+    subleq(a, 3, pc + 15);
+    clr(5);
+    subleq(5, a, pc + 3);
+    subleq(5, 3, pc + 6);
+    p_jump = pc + 2;
+    subleq(4, 3, 0);
+    clr(5);
+    return p_jump;
+}
+
+func emit_jmp() {
+    var p;
+    p = pc + 2;
+    subleq(4, 3, 0);
+    return p;
+}
+
+func load_indirect(dst, ptr) {
+    var instr;
+    instr = pc + 18;
+    mov(instr + 1, ptr);
+    clr(5);
+    subleq(5, 0, pc + 3);
+    clr(dst);
+    subleq(dst, 5, pc + 3);
+    clr(5);
+    return 0;
+}
+
+func store_indirect(ptr, src) {
+    var clr_insn;
+    var sub_insn;
+    clr_insn = pc + 51;
+    sub_insn = clr_insn + 3;
+    mov(clr_insn, ptr);
+    mov(clr_insn + 1, ptr);
+    mov(sub_insn, ptr);
+    clr(5);
+    subleq(5, src, pc + 3);
+    subleq(0, 0, pc + 3);
+    subleq(0, 5, pc + 3);
+    clr(5);
+    return 0;
+}
+
+func push_acc() {
+    mov(11, 8); // PTR = SP
+    store_indirect(11, 9); // mem[PTR] = ACC
+    add_const(8, 1); // SP += 1
+    return 0;
+}
+
+func pop_to(dst) {
+    sub_const(8, 1); // SP -= 1
+    mov(11, 8); // PTR = SP
+    load_indirect(dst, 11);
+    return 0;
+}
+
+// ----------------- Symbol Lookup -----------------
+
+func lookup_var(s, l) {
+    var i;
+    i = 0;
+    while (i < num_locals) {
+        if (str_eq(s, l, loc_s[i], loc_l[i]) == 1) {
+            find_kind = 1;
+            find_off_or_addr = loc_off[i];
+            return 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < num_params) {
+        if (str_eq(s, l, param_s[i], param_l[i]) == 1) {
+            find_kind = 2;
+            find_off_or_addr = param_off[i];
+            return 2;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < num_globs) {
+        if (str_eq(s, l, glob_s[i], glob_l[i]) == 1) {
+            find_kind = 3;
+            find_off_or_addr = glob_addr[i];
+            return 3;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func lookup_arr(s, l) {
+    var i;
+    i = 0;
+    while (i < num_arrs) {
+        if (str_eq(s, l, arr_s[i], arr_l[i]) == 1) {
+            find_arr_cell = arr_ptr_cell[i];
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func lookup_fn(s, l) {
+    var i;
+    i = 0;
+    while (i < num_fns) {
+        if (str_eq(s, l, fn_s[i], fn_l[i]) == 1) {
+            find_fn_entry = fn_entry[i];
+            find_fn_params = fn_nparams[i];
+            find_fn_frame = fn_frame_sz[i];
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ----------------- Expression Compilation -----------------
+
+func compile_primary() {
+    var v;
+    var s;
+    var l;
+
+    if (tok_type == 1) { // INT
+        v = tok_val;
+        eat(1);
+        mov_const(9, v); // ACC = v
+        return 0;
+    }
+    if (tok_type == 20) { // '('
+        eat(20);
+        compile_expr();
+        eat(21); // ')'
+        return 0;
+    }
+    if (tok_type == 2) { // ID
+        s = tok_start;
+        l = tok_len;
+        eat(2);
+        if (tok_type == 20) { // '(' -> call
+            compile_call(s, l);
+            return 0;
+        }
+        if (tok_type == 24) { // '[' -> array indexing
+            eat(24);
+            compile_expr();
+            eat(25); // ']'
+            lookup_arr(s, l);
+            mov(11, find_arr_cell);
+            add(11, 9); // PTR = arr_base + ACC
+            load_indirect(9, 11); // ACC = mem[PTR]
+            return 0;
+        }
+        // Variable read
+        lookup_var(s, l);
+        if (find_kind == 3) {
+            mov(9, find_off_or_addr); // global
+        } else {
+            mov(11, 7); // PTR = FP
+            add_const(11, find_off_or_addr);
+            load_indirect(9, 11); // ACC = mem[FP + off]
+        }
+        return 0;
+    }
+    if (tok_type == 17) { // getc
+        eat(17);
+        eat(20);
+        eat(21);
+        clr(5);
+        subleq(5, 1048574, pc + 3); // IN
+        clr(9);
+        subleq(9, 5, pc + 3);
+        clr(5);
+        return 0;
+    }
+    if (tok_type == 18) { // putc
+        eat(18);
+        eat(20);
+        compile_expr();
+        eat(21);
+        clr(5);
+        subleq(5, 9, pc + 3);
+        subleq(1048575, 5, pc + 3); // OUT
+        clr(5);
+        mov_const(9, 0);
+        return 0;
+    }
+    return 0;
+}
+
+func compile_unary() {
+    if (tok_type == 31) { // '-'
+        eat(31);
+        compile_unary();
+        clr(12); // DIFF = 0
+        sub(12, 9); // DIFF = 0 - ACC
+        mov(9, 12);
+        return 0;
+    }
+    compile_primary();
+    return 0;
+}
+
+func compile_multiplicative() {
+    var step;
+    var p_skip;
+    var skip_target;
+
+    compile_unary();
+    while (tok_type == 32) { // '*'
+        eat(32);
+        push_acc();
+        compile_unary();
+        pop_to(10); // OP_LEFT = left, ACC = right
+
+        // 32-bit multiplication
+        mov(15, 10); // MUL_X = OP_LEFT
+        mov(16, 9);  // MUL_Y = ACC
+        mov_const(17, 0); // MUL_PROD = 0
+
+        step = 0;
+        while (step < 32) {
+            add(17, 17); // MUL_PROD = MUL_PROD + MUL_PROD
+            subleq(16, 3, pc + 6); // if MUL_Y < 0, jump to add
+            p_skip = emit_jmp();   // if MUL_Y >= 0, skip add
+            add(17, 15);           // add MUL_X to MUL_PROD
+            code[p_skip] = pc;     // patch skip jump to here
+            add(16, 16);           // MUL_Y = MUL_Y + MUL_Y
+            step = step + 1;
+        }
+        mov(9, 17); // ACC = MUL_PROD
+    }
+    return 0;
+}
+
+func compile_additive() {
+    var op;
+    compile_multiplicative();
+    while ((tok_type == 30) + (tok_type == 31) > 0) {
+        op = tok_type;
+        eat(op);
+        push_acc();
+        compile_multiplicative();
+        pop_to(10); // OP_LEFT = left, ACC = right
+        if (op == 30) {
+            add(9, 10); // ACC = right + left
+        } else {
+            mov(12, 10); // DIFF = left
+            sub(12, 9);  // DIFF = left - right
+            mov(9, 12);
+        }
+    }
+    return 0;
+}
+
+func compile_comparison() {
+    var op;
+    var p_true;
+    var p_done;
+
+    compile_additive();
+    while ((tok_type >= 34) * (tok_type <= 39) > 0) {
+        op = tok_type;
+        eat(op);
+        push_acc();
+        compile_additive();
+        pop_to(10); // OP_LEFT = left, ACC = right
+
+        if (op == 34) { // '=='
+            mov(12, 10);
+            sub(12, 9); // DIFF = left - right
+            p_true = emit_jz(12);
+            mov_const(9, 0);
+            p_done = emit_jmp();
+            code[p_true] = pc;
+            mov_const(9, 1);
+            code[p_done] = pc;
+        } else {
+            if (op == 35) { // '!='
+                mov(12, 10);
+                sub(12, 9);
+                p_true = emit_jz(12);
+                mov_const(9, 1);
+                p_done = emit_jmp();
+                code[p_true] = pc;
+                mov_const(9, 0);
+                code[p_done] = pc;
+            } else {
+                emit_signed_lt(op);
+            }
+        }
+    }
+    return 0;
+}
+
+func emit_signed_lt(op) {
+    var inv;
+    var p_x_neg;
+    var p_false1;
+    var p_true1;
+    var p_false2;
+    var p_true2;
+    var p_true3;
+    var p_false3;
+    var p_done;
+    var pos_true;
+    var pos_false;
+
+    inv = 0;
+    if (op == 36) { // '<'
+        mov(18, 10); mov(19, 9); inv = 0;
+    }
+    if (op == 37) { // '<='
+        mov(18, 9); mov(19, 10); inv = 1;
+    }
+    if (op == 38) { // '>'
+        mov(18, 9); mov(19, 10); inv = 0;
+    }
+    if (op == 39) { // '>='
+        mov(18, 10); mov(19, 9); inv = 1;
+    }
+
+    // Branch on x < 0
+    p_x_neg = pc + 2;
+    subleq(18, 3, 0);
+
+    // Case x >= 0:
+    p_false1 = pc + 2;
+    subleq(19, 3, 0); // if y < 0 -> false
+    mov(12, 18);
+    sub(12, 19);
+    p_true1 = pc + 2;
+    subleq(12, 3, 0); // if (x-y) < 0 -> true
+    p_false2 = emit_jmp();
+
+    // Case x < 0:
+    code[p_x_neg] = pc;
+    // if y >= 0 -> true
+    subleq(19, 3, pc + 6);
+    p_true2 = pc + 2;
+    subleq(4, 3, 0); // jmp true
+
+    mov(12, 18);
+    sub(12, 19);
+    p_true3 = pc + 2;
+    subleq(12, 3, 0);
+    p_false3 = emit_jmp();
+
+    // True block
+    pos_true = pc;
+    code[p_true1] = pos_true;
+    code[p_true2] = pos_true;
+    code[p_true3] = pos_true;
+    if (inv == 1) { mov_const(9, 0); }
+    else { mov_const(9, 1); }
+    p_done = emit_jmp();
+
+    // False block
+    pos_false = pc;
+    code[p_false1] = pos_false;
+    code[p_false2] = pos_false;
+    code[p_false3] = pos_false;
+    if (inv == 1) { mov_const(9, 1); }
+    else { mov_const(9, 0); }
+
+    code[p_done] = pc;
+    return 0;
+}
+
+func compile_expr() {
+    compile_comparison();
+    return 0;
+}
+
+// ----------------- Statement Compilation -----------------
+
+func compile_call(name_s, name_l) {
+    var num_args;
+    var callee_fp;
+    var ret_cell;
+    var ret_point;
+    var i;
+
+    eat(20); // '('
+    num_args = 0;
+    if (tok_type != 21) {
+        compile_expr();
+        push_acc();
+        num_args = num_args + 1;
+        while (tok_type == 27) { // ','
+            eat(27);
+            compile_expr();
+            push_acc();
+            num_args = num_args + 1;
+        }
+    }
+    eat(21); // ')'
+
+    lookup_fn(name_s, name_l);
+
+    // callee_fp = SP - num_args
+    callee_fp = 12; // reuse DIFF
+    mov(callee_fp, 8);
+    sub_const(callee_fp, num_args);
+
+    // Shift args up by 2 words: CALLEE_FP + i -> CALLEE_FP + 2 + i
+    i = num_args - 1;
+    while (i >= 0) {
+        mov(11, callee_fp);
+        add_const(11, i);
+        load_indirect(6, 11); // TEMP2 = arg[i]
+        mov(11, callee_fp);
+        add_const(11, 2 + i);
+        store_indirect(11, 6);
+        i = i - 1;
+    }
+
+    // OLD_FP = FP at CALLEE_FP + 0
+    mov(11, callee_fp);
+    store_indirect(11, 7);
+
+    // RET_ADDR at CALLEE_FP + 1
+    ret_cell = data_p;
+    data_p = data_p + 1;
+    add_const(11, 1);
+    store_indirect(11, ret_cell);
+
+    // Set FP and SP, jump to callee
+    mov(7, callee_fp);
+    mov(8, callee_fp);
+    add_const(8, find_fn_frame);
+    jmp(find_fn_entry);
+
+    // Return point
+    ret_point = pc;
+    code[ret_cell] = ret_point;
+    mov(9, 13); // ACC = RET_VAL
+    return 0;
+}
+
+func compile_stmt() {
+    var s;
+    var l;
+    var p_else;
+    var p_end;
+    var loop_start;
+    var p_exit;
+
+    if (tok_type == 16) { // return
+        eat(16);
+        compile_expr();
+        mov(13, 9); // RET_VAL = ACC
+        eat(26);    // ';'
+
+        // Emit return sequence:
+        // RET_ADDR = mem[FP + 1]
+        mov(11, 7);
+        add_const(11, 1);
+        load_indirect(14, 11);
+        // FP = mem[FP + 0]
+        load_indirect(7, 7);
+        // SP -= frame_size
+        sub_const(8, cur_frame_sz);
+        jmp(tramp_pc);
+        return 0;
+    }
+
+    if (tok_type == 13) { // if
+        eat(13);
+        eat(20);
+        compile_expr();
+        eat(21);
+        p_else = emit_jz(9); // if ACC == 0 -> jump else
+        eat(22); // '{'
+        while (tok_type != 23) {
+            compile_stmt();
+        }
+        eat(23); // '}'
+
+        if (tok_type == 14) { // else
+            eat(14);
+            p_end = emit_jmp();
+            code[p_else] = pc;
+            eat(22);
+            while (tok_type != 23) {
+                compile_stmt();
+            }
+            eat(23);
+            code[p_end] = pc;
+        } else {
+            code[p_else] = pc;
+        }
+        return 0;
+    }
+
+    if (tok_type == 15) { // while
+        eat(15);
+        loop_start = pc;
+        eat(20);
+        compile_expr();
+        eat(21);
+        p_exit = emit_jz(9);
+        eat(22);
+        while (tok_type != 23) {
+            compile_stmt();
+        }
+        eat(23);
+        jmp(loop_start);
+        code[p_exit] = pc;
+        return 0;
+    }
+
+    if (tok_type == 2) { // ID
+        s = tok_start;
+        l = tok_len;
+        eat(2);
+        if (tok_type == 20) { // call
+            compile_call(s, l);
+            eat(26);
+            return 0;
+        }
+        if (tok_type == 24) { // array assign: a[i] = v;
+            eat(24);
+            compile_expr(); // index
+            push_acc();
+            eat(25);
+            eat(33); // '='
+            compile_expr(); // val
+            pop_to(10); // OP_LEFT = index, ACC = val
+            eat(26);
+            lookup_arr(s, l);
+            mov(11, find_arr_cell);
+            add(11, 10);
+            store_indirect(11, 9);
+            return 0;
+        }
+        if (tok_type == 33) { // var assign: x = v;
+            eat(33);
+            compile_expr();
+            eat(26);
+            lookup_var(s, l);
+            if (find_kind == 3) {
+                mov(find_off_or_addr, 9);
+            } else {
+                mov(11, 7);
+                add_const(11, find_off_or_addr);
+                store_indirect(11, 9);
+            }
+            return 0;
+        }
+    }
+
+    if (tok_type == 17) { // getc()
+        eat(17); eat(20); eat(21); eat(26);
+        return 0;
+    }
+    if (tok_type == 18) { // putc(e)
+        eat(18); eat(20);
+        compile_expr();
+        eat(21); eat(26);
+        clr(5);
+        subleq(5, 9, pc + 3);
+        subleq(1048575, 5, pc + 3);
+        clr(5);
+        return 0;
+    }
+
+    return 0;
+}
+
+// ----------------- Top-level Compilation -----------------
+
+func main() {
+    var ch;
+    var s;
+    var l;
+    var sz;
+    var off;
+    var i;
+    var main_frame;
+    var tramp_jump_addr;
+    var code_end;
+    var stack_base;
+    var p_jump_launcher;
+
+    // 1. Read entire input into src
+    src_len = 0;
+    ch = getc();
+    while (ch != -1) {
+        src[src_len] = ch;
+        src_len = src_len + 1;
+        ch = getc();
+    }
+
+    // 2. Initialize compiler state
+    p10[0] = 1000000000;
+    p10[1] = 100000000;
+    p10[2] = 10000000;
+    p10[3] = 1000000;
+    p10[4] = 100000;
+    p10[5] = 10000;
+    p10[6] = 1000;
+    p10[7] = 100;
+    p10[8] = 10;
+    p10[9] = 1;
+
+    src_pos = 0;
+    pc = 1002;     // Code begins at address 1002 (multiple of 3)
+    data_p = 50;    // User data begins at address 50
+    num_globs = 0;
+    num_arrs = 0;
+    num_fns = 0;
+    num_consts = 0;
+
+    // 3. Emit startup code at address 1002
+    startup_pc = pc;
+    startup_stack_cell = data_p;
+    data_p = data_p + 1;
+
+    // FP = stack_base, SP = stack_base
+    mov(7, startup_stack_cell);
+    mov(8, startup_stack_cell);
+
+    // Call main: OLD_FP = 0 at SP + 0
+    mov(11, 8);
+    store_indirect(11, 3); // ZERO
+    // RET_ADDR = halt at SP + 1
+    add_const(11, 1);
+    halt_cell = data_p;
+    data_p = data_p + 1;
+    store_indirect(11, halt_cell);
+
+    mov(7, 8); // FP = SP
+
+    // Note: SP will be incremented by main_frame once main is parsed
+    // We will reserve code space for add_const(SP, main_frame) and jmp(main_entry)
+    // We will emit them once main is compiled, or jump to main_entry!
+    // Since main is always the last function or defined before use:
+    // Let's emit a jump to main_launcher:
+    p_jump_launcher = emit_jmp();
+
+    // Halt sequence
+    code[halt_cell] = pc;
+    subleq(4, 3, -1); // NEG1 ZERO -1
+
+    // Return trampoline
+    tramp_pc = pc;
+    tramp_jump_addr = pc + 15;
+    mov(tramp_jump_addr + 2, 14); // patch c-field of jump with RET_ADDR
+    subleq(4, 3, 0);
+
+    // 4. Parse declarations
+    next_tok();
+    while (tok_type != 0) { // EOF
+        if (tok_type == 10) { // var
+            eat(10);
+            s = tok_start; l = tok_len;
+            eat(2); eat(26);
+            glob_s[num_globs] = s;
+            glob_l[num_globs] = l;
+            glob_addr[num_globs] = data_p;
+            data_p = data_p + 1;
+            num_globs = num_globs + 1;
+        } else {
+            if (tok_type == 11) { // array
+                eat(11);
+                s = tok_start; l = tok_len;
+                eat(2); eat(24);
+                sz = tok_val;
+                eat(1); eat(25); eat(26);
+                arr_s[num_arrs] = s;
+                arr_l[num_arrs] = l;
+                arr_sz[num_arrs] = sz;
+                arr_ptr_cell[num_arrs] = data_p;
+                data_p = data_p + 1;
+                num_arrs = num_arrs + 1;
+            } else {
+                if (tok_type == 12) { // func
+                    eat(12);
+                    s = tok_start; l = tok_len;
+                    eat(2); eat(20);
+
+                    num_params = 0;
+                    if (tok_type != 21) {
+                        param_s[num_params] = tok_start;
+                        param_l[num_params] = tok_len;
+                        param_off[num_params] = 2 + num_params;
+                        num_params = num_params + 1;
+                        eat(2);
+                        while (tok_type == 27) {
+                            eat(27);
+                            param_s[num_params] = tok_start;
+                            param_l[num_params] = tok_len;
+                            param_off[num_params] = 2 + num_params;
+                            num_params = num_params + 1;
+                            eat(2);
+                        }
+                    }
+                    eat(21);
+
+                    eat(22); // '{'
+                    num_locals = 0;
+                    while (tok_type == 10) { // local var
+                        eat(10);
+                        loc_s[num_locals] = tok_start;
+                        loc_l[num_locals] = tok_len;
+                        loc_off[num_locals] = 2 + num_params + num_locals;
+                        num_locals = num_locals + 1;
+                        eat(2); eat(26);
+                    }
+
+                    cur_frame_sz = 2 + num_params + num_locals;
+                    fn_s[num_fns] = s;
+                    fn_l[num_fns] = l;
+                    fn_entry[num_fns] = pc;
+                    fn_nparams[num_fns] = num_params;
+                    fn_frame_sz[num_fns] = cur_frame_sz;
+                    num_fns = num_fns + 1;
+
+                    while (tok_type != 23) {
+                        compile_stmt();
+                    }
+                    eat(23); // '}'
+
+                    // Fall-through return 0
+                    mov_const(13, 0);
+                    mov(11, 7);
+                    add_const(11, 1);
+                    load_indirect(14, 11);
+                    load_indirect(7, 7);
+                    sub_const(8, cur_frame_sz);
+                    jmp(tramp_pc);
+                }
+            }
+        }
+    }
+
+    // 5. Emit main launcher at current pc
+    code[p_jump_launcher] = pc;
+    // Find main in fn table
+    i = 0;
+    while (i < num_fns) {
+        if (match_kw4(fn_s[i], fn_l[i], 109, 97, 105, 110) == 1) {
+            main_frame = fn_frame_sz[i];
+            add_const(8, main_frame); // SP += main_frame
+            jmp(fn_entry[i]);         // jump to main
+        }
+        i = i + 1;
+    }
+
+    // 6. Lay out arrays and stack at the end of the code section
+    code_end = pc;
+    i = 0;
+    while (i < num_arrs) {
+        code[arr_ptr_cell[i]] = code_end;
+        code_end = code_end + arr_sz[i];
+        i = i + 1;
+    }
+
+    stack_base = code_end;
+    code[startup_stack_cell] = stack_base;
+
+    // Header at address 0: JMP startup_pc
+    code[0] = 4;  // NEG1
+    code[1] = 3;  // ZERO
+    code[2] = startup_pc;
+
+    code[3] = 0;  // ZERO
+    code[4] = -1; // NEG1
+
+    // 7. Output all words separated by space
+    i = 0;
+    while (i < pc) {
+        print_int(code[i]);
+        print_sp();
+        i = i + 1;
+    }
+    putc(10); // newline
+    return 0;
+}
