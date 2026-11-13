@@ -1,0 +1,13 @@
+# Bytecode / binaries
+*.exe
+*.o
+*.obj
+*.bin
+__pycache__/
+*.pyc
+
+# Temporary scratch
+scratch/
+test_*.txt
+debug_*.txt
+*.log
