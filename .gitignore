@@ -11,3 +11,6 @@ scratch/
 test_*.txt
 debug_*.txt
 *.log
+
+ref_repo/
+mem_dump.bin

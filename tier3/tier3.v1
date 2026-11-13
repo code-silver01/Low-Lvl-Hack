@@ -4,93 +4,68 @@
 
 // Memory arrays
 array src[65000];
-var src_len;
-var src_pos;
-
 array code[420000];
-var pc;
-var data_p;
+array p10[10];
 
-// Fixed cells in target memory (addresses 0..19)
-// Address 0..2: JMP startup
-// 3: ZERO = 0
-// 4: NEG1 = -1
-// 5: TEMP
-// 6: TEMP2
-// 7: FP
-// 8: SP
-// 9: ACC
-// 10: OP_LEFT
-// 11: PTR
-// 12: DIFF
-// 13: RET_VAL
-// 14: RET_ADDR
-// 15: MUL_X
-// 16: MUL_Y
-// 17: MUL_PROD
-// 18: CMP_X
-// 19: CMP_Y
-
-// Tokenizer state
-var tok_type;
-var tok_val;
-var tok_start;
-var tok_len;
-
-// Constants table (in target memory)
 array const_vals[2000];
 array const_addrs[2000];
-var num_consts;
 
-// Symbol tables
 array glob_s[300];
 array glob_l[300];
 array glob_addr[300];
-var num_globs;
 
 array arr_s[300];
 array arr_l[300];
 array arr_sz[300];
 array arr_ptr_cell[300];
-var num_arrs;
 
 array fn_s[250];
 array fn_l[250];
 array fn_entry[250];
 array fn_nparams[250];
 array fn_frame_sz[250];
-var num_fns;
 
-// Current function context
 array param_s[12];
 array param_l[12];
 array param_off[12];
-var num_params;
 
 array loc_s[100];
 array loc_l[100];
 array loc_off[100];
-var num_locals;
 
+var src_len;
+var src_pos;
+var pc;
+var data_p;
+
+var tok_type;
+var tok_val;
+var tok_start;
+var tok_len;
+
+var num_consts;
+var num_globs;
+var num_arrs;
+var num_fns;
+var num_params;
+var num_locals;
 var cur_frame_sz;
 
-// Lookups output variables
-var find_kind; // 1=local, 2=param, 3=global
+var find_kind;
 var find_off_or_addr;
 var find_arr_cell;
 var find_fn_entry;
 var find_fn_params;
 var find_fn_frame;
 
-// Runtime points
 var startup_pc;
 var startup_stack_cell;
 var halt_cell;
 var tramp_pc;
 
-// ----------------- Output Helpers -----------------
-
-array p10[10];
+var tramp_compile_expr;
+var p_compile_expr_jump;
+var compile_expr_s;
 
 func print_int(n) {
     var i;
@@ -138,8 +113,6 @@ func print_sp() {
     putc(32); // ' '
     return 0;
 }
-
-// ----------------- String Helpers -----------------
 
 func str_eq(s1, l1, s2, l2) {
     var i;
@@ -199,15 +172,25 @@ func match_kw6(s, l, c0, c1, c2, c3, c4, c5) {
     return 1;
 }
 
-// ----------------- Lexer -----------------
-// Token types:
-// 0: EOF
-// 1: INT
-// 2: ID
-// 10..18: Keywords
-// 10: var, 11: array, 12: func, 13: if, 14: else, 15: while, 16: return, 17: getc, 18: putc
-// 20..27: Symbols: ( ) { } [ ] ; ,
-// 30..39: Operators: + - * = == != < <= > >=
+func classify_ident() {
+    var s;
+    var l;
+    s = tok_start;
+    l = tok_len;
+
+    if (match_kw3(s, l, 118, 97, 114) == 1) { tok_type = 10; return 0; } // var
+    if (match_kw5(s, l, 97, 114, 114, 97, 121) == 1) { tok_type = 11; return 0; } // array
+    if (match_kw4(s, l, 102, 117, 110, 99) == 1) { tok_type = 12; return 0; } // func
+    if (match_kw2(s, l, 105, 102) == 1) { tok_type = 13; return 0; } // if
+    if (match_kw4(s, l, 101, 108, 115, 101) == 1) { tok_type = 14; return 0; } // else
+    if (match_kw5(s, l, 119, 104, 105, 108, 101) == 1) { tok_type = 15; return 0; } // while
+    if (match_kw6(s, l, 114, 101, 116, 117, 114, 110) == 1) { tok_type = 16; return 0; } // return
+    if (match_kw4(s, l, 103, 101, 116, 99) == 1) { tok_type = 17; return 0; } // getc
+    if (match_kw4(s, l, 112, 117, 116, 99) == 1) { tok_type = 18; return 0; } // putc
+
+    tok_type = 2; // ID
+    return 0;
+}
 
 func next_tok() {
     var c;
@@ -308,32 +291,10 @@ func next_tok() {
     return 0;
 }
 
-func classify_ident() {
-    var s;
-    var l;
-    s = tok_start;
-    l = tok_len;
-
-    if (match_kw3(s, l, 118, 97, 114) == 1) { tok_type = 10; return 0; } // var
-    if (match_kw5(s, l, 97, 114, 114, 97, 121) == 1) { tok_type = 11; return 0; } // array
-    if (match_kw4(s, l, 102, 117, 110, 99) == 1) { tok_type = 12; return 0; } // func
-    if (match_kw2(s, l, 105, 102) == 1) { tok_type = 13; return 0; } // if
-    if (match_kw4(s, l, 101, 108, 115, 101) == 1) { tok_type = 14; return 0; } // else
-    if (match_kw5(s, l, 119, 104, 105, 108, 101) == 1) { tok_type = 15; return 0; } // while
-    if (match_kw6(s, l, 114, 101, 116, 117, 114, 110) == 1) { tok_type = 16; return 0; } // return
-    if (match_kw4(s, l, 103, 101, 116, 99) == 1) { tok_type = 17; return 0; } // getc
-    if (match_kw4(s, l, 112, 117, 116, 99) == 1) { tok_type = 18; return 0; } // putc
-
-    tok_type = 2; // ID
-    return 0;
-}
-
 func eat(expected) {
     next_tok();
     return 0;
 }
-
-// ----------------- Direct Code Emission -----------------
 
 func emit(val) {
     code[pc] = val;
@@ -490,8 +451,6 @@ func pop_to(dst) {
     return 0;
 }
 
-// ----------------- Symbol Lookup -----------------
-
 func lookup_var(s, l) {
     var i;
     i = 0;
@@ -552,7 +511,143 @@ func lookup_fn(s, l) {
     return 0;
 }
 
-// ----------------- Expression Compilation -----------------
+func emit_signed_lt(op) {
+    var inv;
+    var p_x_neg;
+    var p_false1;
+    var p_true1;
+    var p_false2;
+    var p_true2;
+    var p_true3;
+    var p_false3;
+    var p_done;
+    var pos_true;
+    var pos_false;
+
+    inv = 0;
+    if (op == 36) { // '<'
+        mov(18, 10); mov(19, 9); inv = 0;
+    }
+    if (op == 37) { // '<='
+        mov(18, 9); mov(19, 10); inv = 1;
+    }
+    if (op == 38) { // '>'
+        mov(18, 9); mov(19, 10); inv = 0;
+    }
+    if (op == 39) { // '>='
+        mov(18, 10); mov(19, 9); inv = 1;
+    }
+
+    // Branch on x < 0
+    p_x_neg = pc + 2;
+    subleq(18, 3, 0);
+
+    // Case x >= 0:
+    p_false1 = pc + 2;
+    subleq(19, 3, 0); // if y < 0 -> false
+    mov(12, 18);
+    sub(12, 19);
+    p_true1 = pc + 2;
+    subleq(12, 3, 0); // if (x-y) < 0 -> true
+    p_false2 = emit_jmp();
+
+    // Case x < 0:
+    code[p_x_neg] = pc;
+    // if y >= 0 -> true
+    subleq(19, 3, pc + 6);
+    p_true2 = pc + 2;
+    subleq(4, 3, 0); // jmp true
+
+    mov(12, 18);
+    sub(12, 19);
+    p_true3 = pc + 2;
+    subleq(12, 3, 0);
+    p_false3 = emit_jmp();
+
+    // True block
+    pos_true = pc;
+    code[p_true1] = pos_true;
+    code[p_true2] = pos_true;
+    code[p_true3] = pos_true;
+    if (inv == 1) { mov_const(9, 0); }
+    else { mov_const(9, 1); }
+    p_done = emit_jmp();
+
+    // False block
+    pos_false = pc;
+    code[p_false1] = pos_false;
+    code[p_false2] = pos_false;
+    code[p_false3] = pos_false;
+    if (inv == 1) { mov_const(9, 1); }
+    else { mov_const(9, 0); }
+
+    code[p_done] = pc;
+    return 0;
+}
+
+func compile_call(name_s, name_l) {
+    var num_args;
+    var callee_fp;
+    var ret_cell;
+    var ret_point;
+    var i;
+
+    eat(20); // '('
+    num_args = 0;
+    if (tok_type != 21) {
+        compile_expr();
+        push_acc();
+        num_args = num_args + 1;
+        while (tok_type == 27) { // ','
+            eat(27);
+            compile_expr();
+            push_acc();
+            num_args = num_args + 1;
+        }
+    }
+    eat(21); // ')'
+
+    lookup_fn(name_s, name_l);
+
+    // callee_fp = SP - num_args
+    callee_fp = 12; // reuse DIFF
+    mov(callee_fp, 8);
+    sub_const(callee_fp, num_args);
+
+    // Shift args up by 2 words: CALLEE_FP + i -> CALLEE_FP + 2 + i
+    i = num_args - 1;
+    while (i >= 0) {
+        mov(11, callee_fp);
+        add_const(11, i);
+        load_indirect(6, 11); // TEMP2 = arg[i]
+        mov(11, callee_fp);
+        add_const(11, 2 + i);
+        store_indirect(11, 6);
+        i = i - 1;
+    }
+
+    // OLD_FP = FP at CALLEE_FP + 0
+    mov(11, callee_fp);
+    store_indirect(11, 7);
+
+    // RET_ADDR at CALLEE_FP + 1
+    ret_cell = data_p;
+    data_p = data_p + 1;
+    add_const(11, 1);
+    store_indirect(11, ret_cell);
+
+    // Set FP and SP, jump to callee
+    mov(7, callee_fp);
+    mov(8, callee_fp);
+    add_const(8, find_fn_frame);
+    jmp(find_fn_entry);
+
+    // Return point
+    ret_point = pc;
+    code[ret_cell] = ret_point;
+    mov(9, 13); // ACC = RET_VAL
+    return 0;
+}
 
 func compile_primary() {
     var v;
@@ -731,148 +826,8 @@ func compile_comparison() {
     return 0;
 }
 
-func emit_signed_lt(op) {
-    var inv;
-    var p_x_neg;
-    var p_false1;
-    var p_true1;
-    var p_false2;
-    var p_true2;
-    var p_true3;
-    var p_false3;
-    var p_done;
-    var pos_true;
-    var pos_false;
-
-    inv = 0;
-    if (op == 36) { // '<'
-        mov(18, 10); mov(19, 9); inv = 0;
-    }
-    if (op == 37) { // '<='
-        mov(18, 9); mov(19, 10); inv = 1;
-    }
-    if (op == 38) { // '>'
-        mov(18, 9); mov(19, 10); inv = 0;
-    }
-    if (op == 39) { // '>='
-        mov(18, 10); mov(19, 9); inv = 1;
-    }
-
-    // Branch on x < 0
-    p_x_neg = pc + 2;
-    subleq(18, 3, 0);
-
-    // Case x >= 0:
-    p_false1 = pc + 2;
-    subleq(19, 3, 0); // if y < 0 -> false
-    mov(12, 18);
-    sub(12, 19);
-    p_true1 = pc + 2;
-    subleq(12, 3, 0); // if (x-y) < 0 -> true
-    p_false2 = emit_jmp();
-
-    // Case x < 0:
-    code[p_x_neg] = pc;
-    // if y >= 0 -> true
-    subleq(19, 3, pc + 6);
-    p_true2 = pc + 2;
-    subleq(4, 3, 0); // jmp true
-
-    mov(12, 18);
-    sub(12, 19);
-    p_true3 = pc + 2;
-    subleq(12, 3, 0);
-    p_false3 = emit_jmp();
-
-    // True block
-    pos_true = pc;
-    code[p_true1] = pos_true;
-    code[p_true2] = pos_true;
-    code[p_true3] = pos_true;
-    if (inv == 1) { mov_const(9, 0); }
-    else { mov_const(9, 1); }
-    p_done = emit_jmp();
-
-    // False block
-    pos_false = pc;
-    code[p_false1] = pos_false;
-    code[p_false2] = pos_false;
-    code[p_false3] = pos_false;
-    if (inv == 1) { mov_const(9, 1); }
-    else { mov_const(9, 0); }
-
-    code[p_done] = pc;
-    return 0;
-}
-
 func compile_expr() {
     compile_comparison();
-    return 0;
-}
-
-// ----------------- Statement Compilation -----------------
-
-func compile_call(name_s, name_l) {
-    var num_args;
-    var callee_fp;
-    var ret_cell;
-    var ret_point;
-    var i;
-
-    eat(20); // '('
-    num_args = 0;
-    if (tok_type != 21) {
-        compile_expr();
-        push_acc();
-        num_args = num_args + 1;
-        while (tok_type == 27) { // ','
-            eat(27);
-            compile_expr();
-            push_acc();
-            num_args = num_args + 1;
-        }
-    }
-    eat(21); // ')'
-
-    lookup_fn(name_s, name_l);
-
-    // callee_fp = SP - num_args
-    callee_fp = 12; // reuse DIFF
-    mov(callee_fp, 8);
-    sub_const(callee_fp, num_args);
-
-    // Shift args up by 2 words: CALLEE_FP + i -> CALLEE_FP + 2 + i
-    i = num_args - 1;
-    while (i >= 0) {
-        mov(11, callee_fp);
-        add_const(11, i);
-        load_indirect(6, 11); // TEMP2 = arg[i]
-        mov(11, callee_fp);
-        add_const(11, 2 + i);
-        store_indirect(11, 6);
-        i = i - 1;
-    }
-
-    // OLD_FP = FP at CALLEE_FP + 0
-    mov(11, callee_fp);
-    store_indirect(11, 7);
-
-    // RET_ADDR at CALLEE_FP + 1
-    ret_cell = data_p;
-    data_p = data_p + 1;
-    add_const(11, 1);
-    store_indirect(11, ret_cell);
-
-    // Set FP and SP, jump to callee
-    mov(7, callee_fp);
-    mov(8, callee_fp);
-    add_const(8, find_fn_frame);
-    jmp(find_fn_entry);
-
-    // Return point
-    ret_point = pc;
-    code[ret_cell] = ret_point;
-    mov(9, 13); // ACC = RET_VAL
     return 0;
 }
 
@@ -1006,8 +961,6 @@ func compile_stmt() {
     return 0;
 }
 
-// ----------------- Top-level Compilation -----------------
-
 func main() {
     var ch;
     var s;
@@ -1087,6 +1040,51 @@ func main() {
     mov(tramp_jump_addr + 2, 14); // patch c-field of jump with RET_ADDR
     subleq(4, 3, 0);
 
+    // Forward trampoline for compile_expr
+    tramp_compile_expr = pc;
+    p_compile_expr_jump = emit_jmp(); // subleq(4, 3, 0)
+
+    // Pre-register compile_expr if found in src
+    compile_expr_s = -1;
+    i = 0;
+    while (i < src_len - 12) {
+        if (src[i] == 99) {
+            if (src[i+1] == 111) {
+                if (src[i+2] == 109) {
+                    if (src[i+3] == 112) {
+                        if (src[i+4] == 105) {
+                            if (src[i+5] == 108) {
+                                if (src[i+6] == 101) {
+                                    if (src[i+7] == 95) {
+                                        if (src[i+8] == 101) {
+                                            if (src[i+9] == 120) {
+                                                if (src[i+10] == 112) {
+                                                    if (src[i+11] == 114) {
+                                                        compile_expr_s = i;
+                                                        i = src_len;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (compile_expr_s != -1) {
+        fn_s[num_fns] = compile_expr_s;
+        fn_l[num_fns] = 12;
+        fn_entry[num_fns] = tramp_compile_expr;
+        fn_nparams[num_fns] = 0;
+        fn_frame_sz[num_fns] = 2;
+        num_fns = num_fns + 1;
+    }
+
     // 4. Parse declarations
     next_tok();
     while (tok_type != 0) { // EOF
@@ -1148,12 +1146,28 @@ func main() {
                     }
 
                     cur_frame_sz = 2 + num_params + num_locals;
-                    fn_s[num_fns] = s;
-                    fn_l[num_fns] = l;
-                    fn_entry[num_fns] = pc;
-                    fn_nparams[num_fns] = num_params;
-                    fn_frame_sz[num_fns] = cur_frame_sz;
-                    num_fns = num_fns + 1;
+                    if (compile_expr_s != -1) {
+                        if (str_eq(s, l, compile_expr_s, 12) == 1) {
+                            code[p_compile_expr_jump] = pc;
+                            fn_entry[0] = pc;
+                            fn_nparams[0] = num_params;
+                            fn_frame_sz[0] = cur_frame_sz;
+                        } else {
+                            fn_s[num_fns] = s;
+                            fn_l[num_fns] = l;
+                            fn_entry[num_fns] = pc;
+                            fn_nparams[num_fns] = num_params;
+                            fn_frame_sz[num_fns] = cur_frame_sz;
+                            num_fns = num_fns + 1;
+                        }
+                    } else {
+                        fn_s[num_fns] = s;
+                        fn_l[num_fns] = l;
+                        fn_entry[num_fns] = pc;
+                        fn_nparams[num_fns] = num_params;
+                        fn_frame_sz[num_fns] = cur_frame_sz;
+                        num_fns = num_fns + 1;
+                    }
 
                     while (tok_type != 23) {
                         compile_stmt();
